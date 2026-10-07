@@ -413,6 +413,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         toolCallId: string;
         /** The parent's model tool call that started this run, when known. */
         launchToolCallId?: string;
+        /** The delegating parent's own subagent tool call, for nested runs. */
+        parentToolCallId?: string;
         projection: SessionProjection;
         lastStopReason?: string;
         workState?: "running" | "idle";
@@ -1178,151 +1180,168 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         inflight.resolve(reason);
     };
 
+    /** Publish one run's start for the parent agent that delegated it. */
+    const onSubagentStart = (parent: Agent, info: SubagentRunInfo): void => {
+        const runId = String(info.runId);
+        if (subagentByRun.has(runId)) return; // already published by a scoped listener
+        const parentLink = subagentByChild.get(String(parent.id));
+        const rootSessionId = parentLink?.rootSessionId ?? String(parent.session.id);
+        const record = sessions.get(rootSessionId);
+        if (record === undefined) return;
+
+        const childSessionId = String(info.id);
+        const toolCallId = `subagent:${runId}`;
+        // The run starts inside the parent's `subagent` / `subagent_fork`
+        // tool dispatch; name that model tool call so clients can nest the
+        // child transcript under the card they already show for it.
+        const launch = liveTool.getStore();
+        const launchToolCallId =
+            launch !== undefined && String(launch.agent.id) === String(parent.id) ? launch.callId : undefined;
+        const payload: Record<string, unknown> = {
+            runId,
+            provider: info.provider,
+            id: childSessionId,
+            local: info.local,
+            ...(parentLink !== undefined ? { parentToolCallId: parentLink.toolCallId } : {}),
+            ...(launchToolCallId !== undefined ? { launchToolCallId } : {}),
+        };
+        const parentSessionId = String(parent.session.id);
+        // Identity is a conversation, not an activation. Never reparent it.
+        const existing = subagentByChild.get(childSessionId);
+        let ancestor: string | undefined = parentSessionId;
+        while (ancestor !== undefined && ancestor !== childSessionId) ancestor = subagentByChild.get(ancestor)?.parentSessionId;
+        if (ancestor === childSessionId || sessions.has(childSessionId) ||
+            (existing !== undefined && existing.parentSessionId !== parentSessionId)) {
+            logWarn(`refusing to reparent subagent ${childSessionId}`);
+            return;
+        }
+        if (clientSubagents) {
+            notify(parentSessionId, {
+                sessionUpdate: "subagent_update", sessionId: childSessionId,
+                state: { state: "running" },
+            });
+        } else {
+            for (const update of record.projection.onEvent({ type: "subagent/start", data: payload })) {
+                notify(rootSessionId, update);
+            }
+        }
+
+        const child = agents.get(info.id);
+        const link: LiveSubagent = {
+            rootSessionId,
+            parentSessionId,
+            agent: child,
+            childSessionId,
+            runId,
+            provider: info.provider,
+            toolCallId,
+            ...(clientSubagents ? { workState: "running" as const } : {}),
+            ...(launchToolCallId !== undefined ? { launchToolCallId } : {}),
+            ...(parentLink !== undefined ? { parentToolCallId: parentLink.toolCallId } : {}),
+            projection: new SessionProjection(undefined, {
+                terminalOutput: clientTerminalOutput,
+                ...(child?.session.header.cwd !== undefined ? { cwd: child.session.header.cwd } : {}),
+                ...(!clientSubagents ? {
+                    subagent: {
+                        childSessionId,
+                        parentToolCallId: toolCallId,
+                        provider: info.provider,
+                        ...(launchToolCallId !== undefined ? { launchToolCallId } : {}),
+                    },
+                } : {}),
+            }),
+        };
+        subagentByChild.set(childSessionId, link);
+        subagentByRun.set(runId, link);
+        if (child !== undefined) watchSubagentParent(child);
+    };
+
+    /** Publish one run's settlement; the start recorded everything it needs. */
+    const onSubagentEnd = (info: SubagentRunEndInfo): void => {
+        const runId = String(info.runId);
+        const link = subagentByRun.get(runId);
+        if (link === undefined) return;
+        const record = sessions.get(link.rootSessionId);
+        if (record !== undefined) {
+            const payload: Record<string, unknown> = {
+                runId,
+                provider: info.provider,
+                id: String(info.id),
+                local: info.local,
+                stopReason: info.stopReason,
+                ...(link.launchToolCallId !== undefined ? { launchToolCallId: link.launchToolCallId } : {}),
+                ...(info.lastAssistantMessage !== undefined
+                    ? { lastAssistantMessage: info.lastAssistantMessage }
+                    : {}),
+                ...(link.parentToolCallId !== undefined ? { parentToolCallId: link.parentToolCallId } : {}),
+            };
+            if (clientSubagents) {
+                // Lifecycle completion observes outgoing output, not receipt.
+                // Only a durable parent user/message can confirm that side.
+                const text = info.lastAssistantMessage?.flatMap(block =>
+                    block.type === "text" ? [block.text] : []).join("");
+                if (text !== undefined && text.length > 0) {
+                    const outgoingId = `dsh:${runId}:out`;
+                    const message = {
+                        sessionUpdate: "session_message" as const,
+                        senderSessionId: link.childSessionId,
+                        recipientSessionId: link.parentSessionId,
+                        content: [{ type: "text" as const, text }],
+                    };
+                    link.resultId = outgoingId;
+                    notify(link.childSessionId, { ...message, messageId: outgoingId,
+                        ...(link.receiptId !== undefined ? { recipientMessageId: link.receiptId } : {}),
+                    });
+                    if (link.receiptId !== undefined) {
+                        notify(link.parentSessionId, { sessionUpdate: "session_message", messageId: link.receiptId,
+                            senderMessageId: outgoingId,
+                        });
+                    }
+                }
+                const reasons: Record<string, string> = {
+                    completed: "end_turn", aborted: "cancelled", "max-tokens": "max_tokens",
+                    refusal: "refusal", error: "error",
+                };
+                // Older activations can settle after a new one has started.
+                if (subagentByChild.get(link.childSessionId)?.runId === runId) {
+                    link.lastStopReason = reasons[info.stopReason] ?? "error";
+                    link.workState = "idle";
+                    notify(link.parentSessionId, {
+                        sessionUpdate: "subagent_update", sessionId: link.childSessionId,
+                        state: { state: "idle", stopReason: link.lastStopReason },
+                    });
+                }
+            } else {
+                for (const update of record.projection.onEvent({ type: "subagent/end", data: payload })) {
+                    notify(link.rootSessionId, update);
+                }
+            }
+        }
+        subagentByRun.delete(runId);
+        if (!clientSubagents && subagentByChild.get(link.childSessionId)?.runId === runId) {
+            subagentByChild.delete(link.childSessionId);
+        }
+    };
+
     /** Observe one parent agent's scoped subagent lifecycle. */
     const watchSubagentParent = (parent: Agent): void => {
         if (watchedSubagentParents.has(parent as object)) return;
         watchedSubagentParents.add(parent as object);
-
-        parent.ctx.on("subagent/start", (info: SubagentRunInfo) => {
-            const parentLink = subagentByChild.get(String(parent.id));
-            const rootSessionId = parentLink?.rootSessionId ?? String(parent.session.id);
-            const record = sessions.get(rootSessionId);
-            if (record === undefined) return;
-
-            const runId = String(info.runId);
-            const childSessionId = String(info.id);
-            const toolCallId = `subagent:${runId}`;
-            // The run starts inside the parent's `subagent` / `subagent_fork`
-            // tool dispatch; name that model tool call so clients can nest the
-            // child transcript under the card they already show for it.
-            const launch = liveTool.getStore();
-            const launchToolCallId =
-                launch !== undefined && String(launch.agent.id) === String(parent.id) ? launch.callId : undefined;
-            const payload: Record<string, unknown> = {
-                runId,
-                provider: info.provider,
-                id: childSessionId,
-                local: info.local,
-                ...(parentLink !== undefined ? { parentToolCallId: parentLink.toolCallId } : {}),
-                ...(launchToolCallId !== undefined ? { launchToolCallId } : {}),
-            };
-            const parentSessionId = String(parent.session.id);
-            // Identity is a conversation, not an activation. Never reparent it.
-            const existing = subagentByChild.get(childSessionId);
-            let ancestor: string | undefined = parentSessionId;
-            while (ancestor !== undefined && ancestor !== childSessionId) ancestor = subagentByChild.get(ancestor)?.parentSessionId;
-            if (ancestor === childSessionId || sessions.has(childSessionId) ||
-                (existing !== undefined && existing.parentSessionId !== parentSessionId)) {
-                logWarn(`refusing to reparent subagent ${childSessionId}`);
-                return;
-            }
-            if (clientSubagents) {
-                notify(parentSessionId, {
-                    sessionUpdate: "subagent_update", sessionId: childSessionId,
-                    state: { state: "running" },
-                });
-            } else {
-                for (const update of record.projection.onEvent({ type: "subagent/start", data: payload })) {
-                    notify(rootSessionId, update);
-                }
-            }
-
-            const child = agents.get(info.id);
-            const link: LiveSubagent = {
-                rootSessionId,
-                parentSessionId,
-                agent: child,
-                childSessionId,
-                runId,
-                provider: info.provider,
-                toolCallId,
-                ...(clientSubagents ? { workState: "running" as const } : {}),
-                ...(launchToolCallId !== undefined ? { launchToolCallId } : {}),
-                projection: new SessionProjection(undefined, {
-                    terminalOutput: clientTerminalOutput,
-                    ...(child?.session.header.cwd !== undefined ? { cwd: child.session.header.cwd } : {}),
-                    ...(!clientSubagents ? {
-                        subagent: {
-                            childSessionId,
-                            parentToolCallId: toolCallId,
-                            provider: info.provider,
-                            ...(launchToolCallId !== undefined ? { launchToolCallId } : {}),
-                        },
-                    } : {}),
-                }),
-            };
-            subagentByChild.set(childSessionId, link);
-            subagentByRun.set(runId, link);
-            if (child !== undefined) watchSubagentParent(child);
-        });
-
-        parent.ctx.on("subagent/end", (info: SubagentRunEndInfo) => {
-            const runId = String(info.runId);
-            const link = subagentByRun.get(runId);
-            if (link === undefined) return;
-            const record = sessions.get(link.rootSessionId);
-            if (record !== undefined) {
-                const parentLink = subagentByChild.get(String(parent.id));
-                const payload: Record<string, unknown> = {
-                    runId,
-                    provider: info.provider,
-                    id: String(info.id),
-                    local: info.local,
-                    stopReason: info.stopReason,
-                    ...(link.launchToolCallId !== undefined ? { launchToolCallId: link.launchToolCallId } : {}),
-                    ...(info.lastAssistantMessage !== undefined
-                        ? { lastAssistantMessage: info.lastAssistantMessage }
-                        : {}),
-                    ...(parentLink !== undefined ? { parentToolCallId: parentLink.toolCallId } : {}),
-                };
-                if (clientSubagents) {
-                    // Lifecycle completion observes outgoing output, not receipt.
-                    // Only a durable parent user/message can confirm that side.
-                    const text = info.lastAssistantMessage?.flatMap(block =>
-                        block.type === "text" ? [block.text] : []).join("");
-                    if (text !== undefined && text.length > 0) {
-                        const outgoingId = `dsh:${runId}:out`;
-                        const message = {
-                            sessionUpdate: "session_message" as const,
-                            senderSessionId: link.childSessionId,
-                            recipientSessionId: link.parentSessionId,
-                            content: [{ type: "text" as const, text }],
-                        };
-                        link.resultId = outgoingId;
-                        notify(link.childSessionId, { ...message, messageId: outgoingId,
-                            ...(link.receiptId !== undefined ? { recipientMessageId: link.receiptId } : {}),
-                        });
-                        if (link.receiptId !== undefined) {
-                            notify(link.parentSessionId, { sessionUpdate: "session_message", messageId: link.receiptId,
-                                senderMessageId: outgoingId,
-                            });
-                        }
-                    }
-                    const reasons: Record<string, string> = {
-                        completed: "end_turn", aborted: "cancelled", "max-tokens": "max_tokens",
-                        refusal: "refusal", error: "error",
-                    };
-                    // Older activations can settle after a new one has started.
-                    if (subagentByChild.get(link.childSessionId)?.runId === runId) {
-                        link.lastStopReason = reasons[info.stopReason] ?? "error";
-                        link.workState = "idle";
-                        notify(link.parentSessionId, {
-                            sessionUpdate: "subagent_update", sessionId: link.childSessionId,
-                            state: { state: "idle", stopReason: link.lastStopReason },
-                        });
-                    }
-                } else {
-                    for (const update of record.projection.onEvent({ type: "subagent/end", data: payload })) {
-                        notify(link.rootSessionId, update);
-                    }
-                }
-            }
-            subagentByRun.delete(runId);
-            if (!clientSubagents && subagentByChild.get(link.childSessionId)?.runId === runId) {
-                subagentByChild.delete(link.childSessionId);
-            }
-        });
+        parent.ctx.on("subagent/start", (info: SubagentRunInfo) => onSubagentStart(parent, info));
+        parent.ctx.on("subagent/end", (info: SubagentRunEndInfo) => onSubagentEnd(info));
     };
+
+    // Scoped dispatch only admits a tagged listener when its scope tag is the
+    // dispatch key or an ancestor of it, and a preset-composed agent's context
+    // does not always match the key the subagent service routes by. This
+    // plugin's own context is untagged, so it sees every run; the delegating
+    // parent is the agent whose tool dispatch is running when the run starts.
+    // Runs already published by a scoped listener are skipped by runId.
+    ctx.on("subagent/start", (info: SubagentRunInfo) => {
+        const launch = liveTool.getStore();
+        if (launch !== undefined) onSubagentStart(launch.agent, info);
+    });
+    ctx.on("subagent/end", (info: SubagentRunEndInfo) => onSubagentEnd(info));
 
     // ------------------------------------------------------------------ //
     // Agent presets (session modes → preset compositions)                 //
