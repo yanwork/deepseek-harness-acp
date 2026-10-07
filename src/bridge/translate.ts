@@ -41,6 +41,8 @@ export interface SubagentAttribution {
     childSessionId: string;
     parentToolCallId: string;
     provider: string;
+    /** The parent's model tool call (`subagent` / `subagent_fork`) that started the run. */
+    launchToolCallId?: string;
 }
 
 /** Harness `TurnEndReason` (structurally typed; see dsh-session types). */
@@ -699,6 +701,7 @@ export class SessionProjection {
         const provider = asString(data["provider"]);
         if (runId === undefined || childSessionId === undefined || provider === undefined) return undefined;
         const parentToolCallId = asString(data["parentToolCallId"]);
+        const launchToolCallId = asString(data["launchToolCallId"]);
         return {
             state,
             runId,
@@ -706,6 +709,7 @@ export class SessionProjection {
             provider,
             local: data["local"] === true,
             ...(parentToolCallId !== undefined ? { parentToolCallId } : {}),
+            ...(launchToolCallId !== undefined ? { launchToolCallId } : {}),
         };
     }
 

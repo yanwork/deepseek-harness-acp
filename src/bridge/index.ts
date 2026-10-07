@@ -338,6 +338,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         runId: string;
         provider: string;
         toolCallId: string;
+        /** The parent's model tool call that started this run, when known. */
+        launchToolCallId?: string;
         projection: SessionProjection;
     }
     const subagentByChild = new Map<string, LiveSubagent>();
@@ -1089,12 +1091,19 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             const runId = String(info.runId);
             const childSessionId = String(info.id);
             const toolCallId = `subagent:${runId}`;
+            // The run starts inside the parent's `subagent` / `subagent_fork`
+            // tool dispatch; name that model tool call so clients can nest the
+            // child transcript under the card they already show for it.
+            const launch = liveTool.getStore();
+            const launchToolCallId =
+                launch !== undefined && String(launch.agent.id) === String(parent.id) ? launch.callId : undefined;
             const payload: Record<string, unknown> = {
                 runId,
                 provider: info.provider,
                 id: childSessionId,
                 local: info.local,
                 ...(parentLink !== undefined ? { parentToolCallId: parentLink.toolCallId } : {}),
+                ...(launchToolCallId !== undefined ? { launchToolCallId } : {}),
             };
             for (const update of record.projection.onEvent({ type: "subagent/start", data: payload })) {
                 notify(rootSessionId, update);
@@ -1107,10 +1116,16 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 runId,
                 provider: info.provider,
                 toolCallId,
+                ...(launchToolCallId !== undefined ? { launchToolCallId } : {}),
                 projection: new SessionProjection(undefined, {
                     terminalOutput: clientTerminalOutput,
                     ...(child?.session.header.cwd !== undefined ? { cwd: child.session.header.cwd } : {}),
-                    subagent: { childSessionId, parentToolCallId: toolCallId, provider: info.provider },
+                    subagent: {
+                        childSessionId,
+                        parentToolCallId: toolCallId,
+                        provider: info.provider,
+                        ...(launchToolCallId !== undefined ? { launchToolCallId } : {}),
+                    },
                 }),
             };
             subagentByChild.set(childSessionId, link);
@@ -1131,6 +1146,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     id: String(info.id),
                     local: info.local,
                     stopReason: info.stopReason,
+                    ...(link.launchToolCallId !== undefined ? { launchToolCallId: link.launchToolCallId } : {}),
                     ...(info.lastAssistantMessage !== undefined
                         ? { lastAssistantMessage: info.lastAssistantMessage }
                         : {}),

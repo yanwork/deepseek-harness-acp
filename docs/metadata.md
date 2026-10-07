@@ -248,6 +248,11 @@ The subagent lifecycle shape is:
 `state` is `"started"` or `"finished"`. `parentToolCallId` is optional. A
 finished lifecycle adds `stopReason: string`.
 
+`launchToolCallId` (optional) names the parent's model tool call
+(`subagent` / `subagent_fork`) whose dispatch started the run, so a client can
+attach the child to the tool call card it already shows. It is absent when the
+run did not start inside a tool dispatch (for example a cold-resumed child).
+
 ### Child transcript attribution
 
 When the client advertises
@@ -261,7 +266,8 @@ update carries:
       "subagent": {
         "childSessionId": "child-1",
         "parentToolCallId": "subagent:run-1",
-        "provider": "local"
+        "provider": "local",
+        "launchToolCallId": "call_abc"
       }
     }
   }
@@ -269,7 +275,8 @@ update carries:
 ```
 
 The annotation lets a client group child output beneath the parent subagent
-tool call without changing the standard ACP update type.
+tool call without changing the standard ACP update type. `launchToolCallId`
+follows the lifecycle rule above.
 
 ### Display terminal metadata
 

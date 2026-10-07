@@ -835,6 +835,79 @@ describe("subagent session origin", () => {
     }, 120_000);
 });
 
+describe("subagent transcript attribution", () => {
+    it("names the parent's launching tool call on the lifecycle and on forwarded child updates", async () => {
+        const sessionRoot = mkdtempSync(join(tmpdir(), "dsh-acp-subagent-launch-"));
+        const workspace = mkdtempSync(join(tmpdir(), "dsh-acp-subagent-launch-ws-"));
+        let parentTurns = 0;
+        const provider = createServer(async (request, response) => {
+            let body = "";
+            for await (const chunk of request) body += String(chunk);
+            const payload = JSON.parse(body) as { system?: unknown; messages?: unknown };
+            const system = typeof payload.system === "string" ? payload.system : "";
+            const transcript = system + JSON.stringify(payload.messages ?? []);
+            response.writeHead(200, { "content-type": "text/event-stream" });
+            if (system.startsWith("Create a concise title")) {
+                response.end(mockModelStream("Launch probe", request.url));
+                return;
+            }
+            if (transcript.includes("You are a delegated subagent")) {
+                response.end(mockModelStream("CHILD", request.url));
+                return;
+            }
+            parentTurns += 1;
+            response.end(parentTurns === 1 ? mockSubagentToolStream("subagent") : mockModelStream("parent done", request.url));
+        });
+        await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
+        const address = provider.address() as { port: number };
+        const client = new AcpTestClient(sessionRoot, workspace, undefined, {
+            DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}`,
+            DSH_PERMISSION_MODE: "danger-full-access",
+        });
+        try {
+            await client.request("initialize", {
+                protocolVersion: 1,
+                clientCapabilities: { _meta: { "subagent-transcript": true } },
+            }, 60_000);
+            const { sessionId } = await client.request("session/new", { cwd: workspace, mcpServers: [] }) as { sessionId: string };
+            await client.request("session/prompt", {
+                sessionId,
+                prompt: [{ type: "text", text: "Delegate with the subagent tool." }],
+            }, 90_000);
+
+            const updates = client.notifications
+                .filter((n) => n.method === "session/update" && n.params["sessionId"] === sessionId)
+                .map((n) => n.params["update"] as Record<string, unknown>);
+            const dshMeta = (update: Record<string, unknown>) =>
+                ((update["_meta"] as Record<string, unknown> | undefined)?.["dsh"] ?? {}) as Record<string, unknown>;
+            const lifecycle = updates
+                .filter((update) => dshMeta(update)["event"] === "subagent/lifecycle")
+                .map((update) => dshMeta(update)["subagent"] as Record<string, unknown>);
+            expect(lifecycle.map((entry) => entry["state"])).toEqual(["started", "finished"]);
+            expect(lifecycle.every((entry) => entry["launchToolCallId"] === "call-subagent")).toBe(true);
+
+            const forwarded = updates.filter((update) => dshMeta(update)["subagent"] !== undefined && dshMeta(update)["event"] === undefined);
+            expect(forwarded.length).toBeGreaterThan(0);
+            for (const update of forwarded) {
+                const attribution = dshMeta(update)["subagent"] as Record<string, unknown>;
+                expect(attribution["launchToolCallId"]).toBe("call-subagent");
+                expect(String(attribution["parentToolCallId"])).toMatch(/^subagent:/);
+            }
+            const childText = forwarded
+                .filter((update) => update["sessionUpdate"] === "agent_message_chunk")
+                .map((update) => ((update["content"] as { text?: string } | undefined)?.text ?? ""))
+                .join("");
+            expect(childText).toContain("CHILD");
+        } finally {
+            await client.close();
+            provider.closeAllConnections();
+            await new Promise<void>((resolve) => provider.close(() => resolve()));
+            rmSync(sessionRoot, { recursive: true, force: true });
+            rmSync(workspace, { recursive: true, force: true });
+        }
+    }, 120_000);
+});
+
 describe("dsh-acp server (e2e smoke)", () => {
     let client: AcpTestClient;
     let sessionRoot: string;
