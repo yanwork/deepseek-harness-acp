@@ -6,3 +6,4 @@ vendor/
 .sessions/
 .pi-subagents/
 coverage/
+.pack/
