@@ -967,15 +967,21 @@ describe("subagent transcript attribution", () => {
                 prompt: [{ type: "text", text: "Delegate with the subagent tool." }],
             }, 90_000);
 
-            const updates = client.notifications
+            const sessionUpdates = () => client.notifications
                 .filter((n) => n.method === "session/update" && n.params["sessionId"] === sessionId)
                 .map((n) => n.params["update"] as Record<string, unknown>);
             const dshMeta = (update: Record<string, unknown>) =>
                 ((update["_meta"] as Record<string, unknown> | undefined)?.["dsh"] ?? {}) as Record<string, unknown>;
-            const lifecycle = updates
+            const lifecycleOf = (list: Record<string, unknown>[]) => list
                 .filter((update) => dshMeta(update)["event"] === "subagent/lifecycle")
                 .map((update) => dshMeta(update)["subagent"] as Record<string, unknown>);
-            expect(lifecycle.map((entry) => entry["state"])).toEqual(["started", "finished"]);
+            // The foreground run settles the parent turn before the child's
+            // stream and teardown (`subagent/end`) flush (bundled dsh
+            // 0.2.1-rc.2), so drain until the finished edge lands.
+            await expect.poll(() => lifecycleOf(sessionUpdates()).map((entry) => entry["state"]), { timeout: 15_000 })
+                .toEqual(["started", "finished"]);
+            const updates = sessionUpdates();
+            const lifecycle = lifecycleOf(updates);
             expect(lifecycle.every((entry) => entry["launchToolCallId"] === "call-subagent")).toBe(true);
 
             const forwarded = updates.filter((update) => dshMeta(update)["subagent"] !== undefined && dshMeta(update)["event"] === undefined);
